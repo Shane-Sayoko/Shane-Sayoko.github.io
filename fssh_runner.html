@@ -28,27 +28,59 @@ const W=()=>canvas.width/devicePixelRatio;
 const H=()=>canvas.height/devicePixelRatio;
 function S(){return Math.min(W(),H())/900;}
 
-// --- Audio ---
+// --- Audio (pre-rendered buffers — zero per-call allocation) ---
 let audioCtx=null;
-function ensureAudio(){if(!audioCtx)audioCtx=new(window.AudioContext||window.webkitAudioContext)();}
-function playTone(freq,dur,type='sine',vol=0.15,slide=0){
-  if(!audioCtx)return;
-  try{
-    const o=audioCtx.createOscillator(),g=audioCtx.createGain();
-    o.type=type;o.frequency.setValueAtTime(freq,audioCtx.currentTime);
-    if(slide)o.frequency.linearRampToValueAtTime(freq+slide,audioCtx.currentTime+dur);
-    g.gain.setValueAtTime(vol,audioCtx.currentTime);
-    g.gain.exponentialRampToValueAtTime(0.001,audioCtx.currentTime+dur);
-    o.connect(g);g.connect(audioCtx.destination);
-    o.start();o.stop(audioCtx.currentTime+dur);
-  }catch(e){}
+let audioGain=null;
+const sfxBuffers={};
+function ensureAudio(){
+  if(audioCtx)return;
+  audioCtx=new(window.AudioContext||window.webkitAudioContext)();
+  audioGain=audioCtx.createGain();
+  audioGain.connect(audioCtx.destination);
+  // Pre-render all sound effects into AudioBuffers
+  function renderTone(freq,dur,type,vol,slide){
+    const sr=audioCtx.sampleRate;
+    const len=Math.ceil(sr*dur);
+    const buf=audioCtx.createBuffer(1,len,sr);
+    const d=buf.getChannelData(0);
+    for(let i=0;i<len;i++){
+      const t=i/sr;const frac=t/dur;
+      const f=slide?freq+(slide*t/dur):freq;
+      const phase=2*Math.PI*f*t;
+      let sample=0;
+      if(type==='sine')sample=Math.sin(phase);
+      else if(type==='sawtooth'){const p=(f*t)%1;sample=2*p-1;}
+      else if(type==='triangle'){const p=(f*t)%1;sample=4*Math.abs(p-0.5)-1;}
+      // Exponential decay envelope
+      const env=vol*Math.pow(0.001/vol,frac);
+      d[i]=sample*env;
+    }
+    return buf;
+  }
+  sfxBuffers.hop=renderTone(440,0.15,'sine',0.12,300);
+  sfxBuffers.frustrated=renderTone(150,0.4,'sawtooth',0.15,-80);
+  sfxBuffers.photon=renderTone(880,0.1,'sine',0.1,200);
+  sfxBuffers.phonon=renderTone(220,0.12,'triangle',0.08,0);
+  sfxBuffers.ci1=renderTone(523,0.3,'sine',0.1,0);
+  sfxBuffers.ci2=renderTone(659,0.3,'sine',0.08,0);
+  sfxBuffers.ci3=renderTone(784,0.4,'sine',0.08,0);
+  sfxBuffers.go1=renderTone(440,0.2,'sawtooth',0.1,-200);
+  sfxBuffers.go2=renderTone(330,0.3,'sawtooth',0.08,-150);
 }
-function sfxHop(){playTone(440,0.15,'sine',0.12,300);}
-function sfxFrustrated(){playTone(150,0.4,'sawtooth',0.15,-80);}
-function sfxPhoton(){playTone(880,0.1,'sine',0.1,200);}
-function sfxPhonon(){playTone(220,0.12,'triangle',0.08,0);}
-function sfxCI(){playTone(523,0.3,'sine',0.1,0);setTimeout(()=>playTone(659,0.3,'sine',0.08,0),100);setTimeout(()=>playTone(784,0.4,'sine',0.08,0),200);}
-function sfxGameOver(){playTone(440,0.2,'sawtooth',0.1,-200);setTimeout(()=>playTone(330,0.3,'sawtooth',0.08,-150),200);}
+function playBuf(name,delay){
+  if(!audioCtx||!sfxBuffers[name])return;
+  const s=audioCtx.createBufferSource();
+  s.buffer=sfxBuffers[name];
+  s.connect(audioGain);
+  s.start(audioCtx.currentTime+(delay||0));
+  s.onended=()=>{s.disconnect();};
+}
+function sfxHop(){playBuf('hop');}
+function sfxFrustrated(){playBuf('frustrated');}
+function sfxPhoton(){playBuf('photon');}
+function sfxPhonon(){playBuf('phonon');}
+function sfxCI(){playBuf('ci1');playBuf('ci2',0.1);playBuf('ci3',0.2);}
+function sfxGameOver(){playBuf('go1');playBuf('go2',0.2);}
 
 // --- Constants ---
 const NUM_SURFACES=4;
@@ -150,31 +182,43 @@ let nextCITime=0;
 let activeCouplingZone=null;
 
 let playerX=0,playerY=0;
-let playerTrail=[];
+// Ring buffer for player trail — no shift(), no per-frame object creation
+const TRAIL_MAX=30;
+const playerTrail=[];for(let i=0;i<TRAIL_MAX;i++)playerTrail.push({x:0,y:0,age:0,surf:0,active:false});
+let trailHead=0,trailLen=0;
 let playerFlash=0,playerShake=0;
 let speedTransition=0,targetSpeed=0;
 let frustratedText='';let frustratedTextTimer=0;
 
 let collectibles=[];
-let particles=[];
+// Particle pool — pre-allocate to avoid per-spawn object creation
+const PARTICLE_MAX=150;
+const particles=[];for(let i=0;i<PARTICLE_MAX;i++)particles.push({x:0,y:0,vx:0,vy:0,life:0,maxLife:0,color:'',size:0});
+let particleCount=0;
 let nextCollectibleDist=300;
 
 let hopUpPressed=false;
 let hopDownPressed=false;
 
 // --- Buttons ---
-let buttons=[];// {id, x, y, w, h, text, color}
-function addButton(id,x,y,w,h,text,color){buttons.push({id,x,y,w,h,text,color});}
-function clearButtons(){buttons=[];}
+const buttons=[];// {id, x, y, w, h, text, color}
+let buttonCount=0;
+function addButton(id,x,y,w,h,text,color){
+  if(buttonCount<buttons.length){const b=buttons[buttonCount];b.id=id;b.x=x;b.y=y;b.w=w;b.h=h;b.text=text;b.color=color;}
+  else buttons.push({id,x,y,w,h,text,color});
+  buttonCount++;
+}
+function clearButtons(){buttonCount=0;}
 function hitTest(mx,my){
-  for(const b of buttons){
+  for(let i=0;i<buttonCount;i++){
+    const b=buttons[i];
     if(mx>=b.x&&mx<=b.x+b.w&&my>=b.y&&my<=b.y+b.h)return b.id;
   }
   return null;
 }
 function drawButtons(){
   const sc=S();
-  for(const b of buttons){
+  for(let i=0;i<buttonCount;i++){const b=buttons[i];
     // Button background
     ctx.fillStyle='rgba(20,20,40,0.8)';
     ctx.strokeStyle=b.color||'#66aaff';
@@ -265,11 +309,20 @@ function surfaceY(screenX,surfIndex){
 }
 function surfacePotential(surfIndex,worldX){return cumulativeGap(surfIndex,worldX);}
 
-// --- Surface Y Cache (per-frame) ---
+// --- Surface Y Cache ---
 const CACHE_STEP=3;
+const WORKER_BUFFER=40;// extra steps each side in Worker for scroll drift
 let surfCache=[];// surfCache[surfIndex] = Float64Array
 let cacheLen=0;
 let cacheValid=false;
+let cacheWorldStart=0;// world X at cache index 0
+
+// Device-pixel-aligned scroll offset for rendering — set once per frame in loop()
+// ALL draw code and visual cachedY calls use this instead of raw scrollOffset
+let renderScroll=0;
+
+// No more Path2D — draw surfaces directly each frame from cachedY
+// This avoids creating new objects every frame (GC pressure = stutter)
 
 // --- Web Worker for parallel surface cache computation ---
 const _workerSrc=`'use strict';
@@ -308,24 +361,27 @@ function gBetween(pi,x,diff,gps,acs,cis){
   return gap>0?gap:0;
 }
 self.onmessage=function(e){
-  const d=e.data,so=d.so,diff=gDiff(d.dist),ph=d.ph,gps=d.gps,acs=d.acs,cis=d.cis;
+  const d=e.data,wStart=d.wStart,diff=gDiff(d.dist),ph=d.ph,gps=d.gps,acs=d.acs,cis=d.cis;
   const cY=d.sH*0.75,sp=2.0,steps=d.steps;
   const out=new Float64Array(steps*NS);
   for(let i=0;i<steps;i++){
-    const wx=i*CS+so;let cg=0;
+    const wx=wStart+i*CS;let cg=0;
     for(let s=0;s<NS;s++){
       const sm=sSmooth(s,wx,diff,ph);
       if(s>0)cg+=gBetween(s-1,wx,diff,gps,acs,cis);
       out[s*steps+i]=cY+sm-cg*sp;
     }
   }
-  self.postMessage({buf:out,steps:steps,id:d.id},[out.buffer]);
+  self.postMessage({buf:out,steps:steps,id:d.id,wStart:wStart},[out.buffer]);
 };`;
 
 let cacheWorker=null;
-let workerPending=null;// {buf, steps, id}
+let workerPending=null;
 let workerBusy=false;
 let workerFrameId=0;
+// Pre-allocated arrays for worker messages — avoid per-frame spread/map allocation
+const _wkPh=new Array(6);
+const _wkGps=[];for(let i=0;i<3;i++)_wkGps.push(new Array(4));
 
 try{
   cacheWorker=new Worker(URL.createObjectURL(new Blob([_workerSrc],{type:'application/javascript'})));
@@ -337,22 +393,29 @@ try{
 
 function requestWorkerCache(){
   if(!cacheWorker||workerBusy)return;
-  const steps=Math.ceil(W()/CACHE_STEP)+2;
-  // Serialize ACs as flat array [pairIndex, x, width, minGap, ...]
-  const acFlat=new Float64Array(avoidedCrossings.length*4);
+  const screenSteps=Math.ceil(W()/CACHE_STEP)+2;
+  const steps=screenSteps+WORKER_BUFFER*2+1;
+  const wStart=Math.floor((scrollOffset-WORKER_BUFFER*CACHE_STEP)/CACHE_STEP)*CACHE_STEP;
+  // Build flat arrays for transfer (unavoidable allocation — buffers get detached)
+  const acLen=avoidedCrossings.length*4;
+  const acFlat=new Float64Array(acLen);
   for(let i=0;i<avoidedCrossings.length;i++){
     const a=avoidedCrossings[i];
     acFlat[i*4]=a.pairIndex;acFlat[i*4+1]=a.x;acFlat[i*4+2]=a.width;acFlat[i*4+3]=a.minGap;
   }
-  const ciFlat=new Float64Array(conicalIntersections.length*3);
+  const ciLen=conicalIntersections.length*3;
+  const ciFlat=new Float64Array(ciLen);
   for(let i=0;i<conicalIntersections.length;i++){
     const c=conicalIntersections[i];
     ciFlat[i*3]=c.pairIndex;ciFlat[i*3+1]=c.x;ciFlat[i*3+2]=c.width;
   }
+  // Copy phases into pre-allocated arrays (no spread/map allocation)
+  for(let i=0;i<phases.length;i++)_wkPh[i]=phases[i];
+  for(let i=0;i<gapPhaseSets.length;i++){const src=gapPhaseSets[i],dst=_wkGps[i];for(let j=0;j<src.length;j++)dst[j]=src[j];}
   workerFrameId++;workerBusy=true;
   cacheWorker.postMessage({
-    so:scrollOffset,dist:distance,
-    ph:[...phases],gps:gapPhaseSets.map(p=>[...p]),
+    wStart:wStart,dist:distance,
+    ph:_wkPh,gps:_wkGps,
     acs:acFlat,cis:ciFlat,
     sH:H(),steps:steps,id:workerFrameId
   },[acFlat.buffer,ciFlat.buffer]);
@@ -371,13 +434,16 @@ function applyWorkerCache(){
     const arr=surfCache[s],off=s*steps;
     for(let i=0;i<steps;i++)arr[i]=buf[off+i];
   }
+  cacheWorldStart=d.wStart;
   cacheValid=true;
   return true;
 }
 
 function buildSurfaceCache(){
   const w=W();
-  const steps=Math.ceil(w/CACHE_STEP)+2;
+  // Snap to CACHE_STEP grid — same grid alignment as Worker cache
+  const so=Math.floor(scrollOffset/CACHE_STEP)*CACHE_STEP;
+  const steps=Math.ceil((scrollOffset+w-so)/CACHE_STEP)+3;
   if(cacheLen!==steps){
     cacheLen=steps;
     surfCache=[];
@@ -385,7 +451,7 @@ function buildSurfaceCache(){
   }
   const centerY=H()*0.75,spread=2.0;
   for(let i=0;i<steps;i++){
-    const worldX=i*CACHE_STEP+scrollOffset;
+    const worldX=i*CACHE_STEP+so;
     let cumGap=0;
     for(let s=0;s<NUM_SURFACES;s++){
       const smooth=surfaceSmooth(s,worldX);
@@ -393,16 +459,19 @@ function buildSurfaceCache(){
       surfCache[s][i]=centerY+smooth-cumGap*spread;
     }
   }
+  cacheWorldStart=so;
   cacheValid=true;
 }
 
 function cachedY(screenX,surfIndex){
   if(!cacheValid)return surfaceY(screenX,surfIndex);
-  const idx=screenX/CACHE_STEP;
-  const i0=Math.max(0,Math.min(Math.floor(idx),cacheLen-2));
+  // Use renderScroll (device-pixel-aligned) so all visual elements share the same world mapping
+  const worldX=screenX+renderScroll;
+  const idx=(worldX-cacheWorldStart)/CACHE_STEP;
+  const i0=Math.floor(idx);
+  if(i0<0||i0>=cacheLen-1)return surfaceY(screenX,surfIndex);
   const t=idx-i0;
-  const arr=surfCache[surfIndex];
-  return arr[i0]*(1-t)+arr[i0+1]*t;
+  return surfCache[surfIndex][i0]*(1-t)+surfCache[surfIndex][i0+1]*t;
 }
 
 // --- Avoided Crossing & CI ---
@@ -539,10 +608,11 @@ function startGame(){
   photonsCollected=0;phononsCollected=0;
   coherence=0;maxCoherence=0;
   frustration=0;currentSurface=0;
-  scrollOffset=0;scrollSpeed=2;
+  scrollOffset=0;smoothScroll=0;scrollSpeed=2;
   gameTime=0;timeSinceLastHop=0;
-  playerTrail=[];playerFlash=0;playerShake=0;
-  collectibles=[];particles=[];
+  trailHead=0;trailLen=0;for(let i=0;i<TRAIL_MAX;i++)playerTrail[i].active=false;
+  playerFlash=0;playerShake=0;
+  collectibles=[];particleCount=0;
   avoidedCrossings=[];conicalIntersections=[];
   nextCITime=25+Math.random()*20;
   nextCollectibleDist=300;
@@ -551,6 +621,7 @@ function startGame(){
   nameInput='';
   for(let i=0;i<phases.length;i++)phases[i]=Math.random()*Math.PI*2;
   for(const gp of gapPhaseSets)for(let i=0;i<gp.length;i++)gp[i]=Math.random()*Math.PI*2;
+  cacheValid=false;workerPending=null;workerBusy=false;
 }
 
 // --- Update ---
@@ -572,11 +643,14 @@ function update(dt){
   else{scrollSpeed+=(targetSpeed-scrollSpeed)*dt*3;}
   scrollOffset+=scrollSpeed*60*dt;
   distance+=scrollSpeed*60*dt*0.1;
-  playerY=surfaceY(playerX,currentSurface);
+  playerY=cacheValid?cachedY(playerX,currentSurface):surfaceY(playerX,currentSurface);
 
-  playerTrail.push({x:playerX,y:playerY,age:0,surf:currentSurface});
-  if(playerTrail.length>30)playerTrail.shift();
-  for(const t of playerTrail)t.age+=dt;
+  // Ring buffer trail — reuse pre-allocated objects
+  const tSlot=playerTrail[trailHead];
+  tSlot.x=playerX;tSlot.y=playerY;tSlot.age=0;tSlot.surf=currentSurface;tSlot.active=true;
+  trailHead=(trailHead+1)%TRAIL_MAX;
+  if(trailLen<TRAIL_MAX)trailLen++;
+  for(let ti=0;ti<trailLen;ti++)playerTrail[ti].age+=dt;
 
   activeCouplingZone=null;
   if(currentSurface<NUM_SURFACES-1){const ct=checkCouplingForPair(currentSurface);if(ct)activeCouplingZone={pairIndex:currentSurface,type:ct,dir:'up'};}
@@ -650,7 +724,7 @@ function update(dt){
   for(const c of collectibles){
     if(!c.alive)continue;
     const cx=c.x-scrollOffset;
-    const cy=surfaceY(cx,c.surface)+Math.sin(gameTime*3+c.phase)*8;
+    const cy=cachedY(cx,c.surface)+Math.sin(gameTime*3+c.phase)*8;
     const dx=playerX-cx,dy=playerY-cy;
     if(dx*dx+dy*dy<collectRadius){
       c.alive=false;
@@ -658,25 +732,29 @@ function update(dt){
       const surfaceScore=[20,50,100,150][c.surface]||50;
       if(c.isPhoton){score+=Math.round(surfaceScore*mult);photonsCollected++;sfxPhoton();}
       else{score+=Math.round(surfaceScore*mult);phononsCollected++;sfxPhonon();}
-      for(let i=0;i<8;i++){const angle=Math.PI*2*i/8;particles.push({x:cx,y:cy,vx:Math.cos(angle)*80+Math.random()*20,vy:Math.sin(angle)*80+Math.random()*20,life:0.5,maxLife:0.5,color:c.isPhoton?'#ffd700':'#4488ff',size:3*sc});}
+      for(let i=0;i<8&&particleCount<PARTICLE_MAX;i++){const angle=Math.PI*2*i/8;const p=particles[particleCount++];p.x=cx;p.y=cy;p.vx=Math.cos(angle)*80+Math.random()*20;p.vy=Math.sin(angle)*80+Math.random()*20;p.life=0.5;p.maxLife=0.5;p.color=c.isPhoton?'#ffd700':'#4488ff';p.size=3*sc;}
     }
   }
+  // Update particles in-place, compact live ones to front
   let pw=0;
-  for(let i=0;i<particles.length;i++){
+  for(let i=0;i<particleCount;i++){
     const p=particles[i];p.x+=p.vx*dt;p.y+=p.vy*dt;p.life-=dt;
-    if(p.life>0)particles[pw++]=p;
+    if(p.life>0){if(pw!==i){const t=particles[pw];particles[pw]=particles[i];particles[i]=t;}pw++;}
   }
-  particles.length=Math.min(pw,150);
+  particleCount=pw;
 }
 
 function triggerFrustrated(msg){
   frustration=Math.min(100,frustration+18);playerFlash=0.7;playerShake=0.6;
   frustratedText=msg;frustratedTextTimer=1.5;sfxFrustrated();
-  for(let i=0;i<12;i++){const angle=Math.PI*2*i/12;particles.push({x:playerX,y:playerY,vx:Math.cos(angle)*60,vy:Math.sin(angle)*60,life:0.4,maxLife:0.4,color:'#ff3333',size:3*S()});}
+  const sc=S();
+  for(let i=0;i<12&&particleCount<PARTICLE_MAX;i++){const angle=Math.PI*2*i/12;const p=particles[particleCount++];p.x=playerX;p.y=playerY;p.vx=Math.cos(angle)*60;p.vy=Math.sin(angle)*60;p.life=0.4;p.maxLife=0.4;p.color='#ff3333';p.size=3*sc;}
 }
 function spawnHopParticles(x,y,isCI){
   const count=isCI?16:10;const color=isCI?'#ffffff':SURFACE_COLORS[currentSurface];const sc=S();
-  for(let i=0;i<count;i++){const angle=Math.PI*2*i/count;const speed=isCI?150:100;particles.push({x,y,vx:Math.cos(angle)*speed*(0.5+Math.random()*0.5),vy:Math.sin(angle)*speed*(0.5+Math.random()*0.5),life:0.6,maxLife:0.6,color,size:(isCI?4:3)*sc});}
+  const room=PARTICLE_MAX-particleCount;if(room<=0)return;
+  const n=Math.min(count,room);
+  for(let i=0;i<n;i++){const angle=Math.PI*2*i/count;const speed=isCI?150:100;const p=particles[particleCount++];p.x=x;p.y=y;p.vx=Math.cos(angle)*speed*(0.5+Math.random()*0.5);p.vy=Math.sin(angle)*speed*(0.5+Math.random()*0.5);p.life=0.6;p.maxLife=0.6;p.color=color;p.size=(isCI?4:3)*sc;}
 }
 
 // --- Draw ---
@@ -686,8 +764,7 @@ function draw(){
   clearButtons();
   if(state===STATE.MENU){drawMenu();drawButtons();return;}
   if(state===STATE.INSTRUCTIONS){drawInstructions();drawButtons();return;}
-  // Use worker cache if ready, otherwise sync fallback
-  if(!applyWorkerCache())buildSurfaceCache();
+  // Cache already built in loop() before draw()
   drawGrid();drawCouplingBands();drawSurfaces();drawCollectibles();drawPlayer();drawParticles();drawHUD();
   if(state===STATE.PAUSED){drawPaused();drawButtons();}
   if(state===STATE.GAMEOVER){drawGameOver();drawButtons();}
@@ -696,23 +773,29 @@ function draw(){
 
 function drawGrid(){
   const w=W(),h=H();ctx.strokeStyle='rgba(30,60,90,0.12)';ctx.lineWidth=0.5;
-  const sp=60;const ox=(scrollOffset*0.3)%sp;
+  const sp=60;const ox=(renderScroll*0.3)%sp;
   ctx.beginPath();
   for(let x=-ox;x<w;x+=sp){ctx.moveTo(x,0);ctx.lineTo(x,h);}
   for(let y=0;y<h;y+=sp){ctx.moveTo(0,y);ctx.lineTo(w,y);}
   ctx.stroke();
 }
 function drawSurfaces(){
-  const sc=S(),w=W();
+  if(!cacheValid)return;
+  const sc=S(),w=W(),dpr=devicePixelRatio;
+  // Draw directly from cachedY — no Path2D allocation, no GC stutter
+  // Quantize Y to device pixels for stable anti-aliasing (no shimmer)
   for(let s=0;s<NUM_SURFACES;s++){
-    const p=new Path2D();
-    for(let x=0;x<w;x+=3){const y=cachedY(x,s);if(x===0)p.moveTo(x,y);else p.lineTo(x,y);}
-    // Glow layers (replace shadowBlur)
     const rgb=SURFACE_RGB[s];
-    ctx.strokeStyle=`rgba(${rgb[0]},${rgb[1]},${rgb[2]},0.08)`;ctx.lineWidth=12*sc;ctx.stroke(p);
-    ctx.strokeStyle=`rgba(${rgb[0]},${rgb[1]},${rgb[2]},0.15)`;ctx.lineWidth=6*sc;ctx.stroke(p);
-    // Main line
-    ctx.strokeStyle=SURFACE_COLORS[s];ctx.lineWidth=2.5*sc;ctx.stroke(p);
+    ctx.beginPath();
+    for(let sx=0;sx<=w;sx+=CACHE_STEP){
+      const y=Math.round(cachedY(sx,s)*dpr)/dpr;
+      if(sx===0)ctx.moveTo(sx,y);else ctx.lineTo(sx,y);
+    }
+    ctx.strokeStyle=`rgba(${rgb[0]},${rgb[1]},${rgb[2]},0.12)`;ctx.lineWidth=8*sc;ctx.stroke();
+    ctx.strokeStyle=SURFACE_COLORS[s];ctx.lineWidth=2.5*sc;ctx.stroke();
+  }
+  // Labels
+  for(let s=0;s<NUM_SURFACES;s++){
     const labelY=cachedY(5,s);
     ctx.font=`bold ${Math.round(14*sc)}px "Courier New",monospace`;
     ctx.fillStyle=SURFACE_COLORS[s];ctx.textAlign='left';ctx.globalAlpha=0.6;
@@ -733,8 +816,8 @@ function drawCouplingBands(){
     const halfSpan=ac.width*0.8;
     const bandStartWorld=ac.x-halfSpan;
     const bandEndWorld=ac.x+halfSpan;
-    const bsScreen=bandStartWorld-scrollOffset;
-    const beScreen=bandEndWorld-scrollOffset;
+    const bsScreen=bandStartWorld-renderScroll;
+    const beScreen=bandEndWorld-renderScroll;
     // Skip if fully off screen
     if(beScreen<-10||bsScreen>w+10)continue;
     const drawStart=Math.max(0,bsScreen);
@@ -748,9 +831,10 @@ function drawCouplingBands(){
     }
 
     // Build shape path
+    const step=CACHE_STEP;
     ctx.beginPath();
-    for(let bx=drawStart;bx<=drawEnd;bx+=3)ctx.lineTo(bx,cachedY(bx,pair));
-    for(let bx=drawEnd;bx>=drawStart;bx-=3)ctx.lineTo(bx,cachedY(bx,pair+1));
+    for(let bx=drawStart;bx<=drawEnd;bx+=step)ctx.lineTo(bx,cachedY(bx,pair));
+    for(let bx=drawEnd;bx>=drawStart;bx-=step)ctx.lineTo(bx,cachedY(bx,pair+1));
     ctx.closePath();
 
     if(isCI){
@@ -762,20 +846,17 @@ function drawCouplingBands(){
     ctx.fill();ctx.stroke();
 
     if(!isCI){
-      // Edge glow (no shadowBlur)
-      ctx.strokeStyle=`rgba(${bc[0]},${bc[1]},${bc[2]},${0.15*pulse})`;ctx.lineWidth=4*sc;
-      ctx.beginPath();for(let bx=drawStart;bx<=drawEnd;bx+=3){const y=cachedY(bx,pair+1);if(bx===drawStart)ctx.moveTo(bx,y);else ctx.lineTo(bx,y);}ctx.stroke();
-      ctx.beginPath();for(let bx=drawStart;bx<=drawEnd;bx+=3){const y=cachedY(bx,pair);if(bx===drawStart)ctx.moveTo(bx,y);else ctx.lineTo(bx,y);}ctx.stroke();
-      ctx.strokeStyle=`rgba(${bc[0]},${bc[1]},${bc[2]},${0.3*pulse})`;ctx.lineWidth=sc;
-      ctx.beginPath();for(let bx=drawStart;bx<=drawEnd;bx+=3){const y=cachedY(bx,pair+1);if(bx===drawStart)ctx.moveTo(bx,y);else ctx.lineTo(bx,y);}ctx.stroke();
-      ctx.beginPath();for(let bx=drawStart;bx<=drawEnd;bx+=3){const y=cachedY(bx,pair);if(bx===drawStart)ctx.moveTo(bx,y);else ctx.lineTo(bx,y);}ctx.stroke();
+      // Edge glow — single pass instead of 4 separate strokes
+      ctx.strokeStyle=`rgba(${bc[0]},${bc[1]},${bc[2]},${0.2*pulse})`;ctx.lineWidth=3*sc;
+      ctx.beginPath();for(let bx=drawStart;bx<=drawEnd;bx+=step){const y=cachedY(bx,pair+1);if(bx===drawStart)ctx.moveTo(bx,y);else ctx.lineTo(bx,y);}ctx.stroke();
+      ctx.beginPath();for(let bx=drawStart;bx<=drawEnd;bx+=step){const y=cachedY(bx,pair);if(bx===drawStart)ctx.moveTo(bx,y);else ctx.lineTo(bx,y);}ctx.stroke();
     }
   }
   // CI bands (not attached to an AC)
   for(const ci of conicalIntersections){
     const pair=ci.pairIndex;
     const halfSpan=ci.width*1.5;
-    const bs=ci.x-halfSpan-scrollOffset,be=ci.x+halfSpan-scrollOffset;
+    const bs=ci.x-halfSpan-renderScroll,be=ci.x+halfSpan-renderScroll;
     if(be<-10||bs>w+10)continue;
     // Check if already drawn as part of an AC
     let coveredByAC=false;
@@ -784,8 +865,8 @@ function drawCouplingBands(){
       const ds=Math.max(0,bs),de=Math.min(w,be);
       if(de-ds>3){
         ctx.beginPath();
-        for(let bx=ds;bx<=de;bx+=3)ctx.lineTo(bx,cachedY(bx,pair));
-        for(let bx=de;bx>=ds;bx-=3)ctx.lineTo(bx,cachedY(bx,pair+1));
+        for(let bx=ds;bx<=de;bx+=CACHE_STEP)ctx.lineTo(bx,cachedY(bx,pair));
+        for(let bx=de;bx>=ds;bx-=CACHE_STEP)ctx.lineTo(bx,cachedY(bx,pair+1));
         ctx.closePath();
         ctx.fillStyle=`rgba(255,255,255,${0.25*pulse})`;ctx.strokeStyle=`rgba(255,255,255,${0.6*pulse})`;ctx.lineWidth=2.5*sc;
         ctx.fill();ctx.stroke();
@@ -793,11 +874,19 @@ function drawCouplingBands(){
     }
   }
   for(const ci of conicalIntersections){
-    const cx=ci.x-scrollOffset;
+    const cx=ci.x-renderScroll;
     if(cx>-100&&cx<w+100){
       const y0=cachedY(cx,ci.pairIndex),y1=cachedY(cx,ci.pairIndex+1),cy=(y0+y1)/2;
-      const t=gameTime*3;ctx.save();ctx.translate(cx,cy);
-      for(let r=5;r<45*sc;r+=5*sc){ctx.beginPath();ctx.arc(0,0,r,t+r*0.1,t+r*0.1+Math.PI*1.5);ctx.strokeStyle=`rgba(255,255,255,${0.6-r/(75*sc)})`;ctx.lineWidth=2*sc;ctx.stroke();}
+      const t=gameTime*3;ctx.save();ctx.translate(cx,cy);ctx.lineWidth=2*sc;
+      // Batch arcs into one path per 2 rings to reduce draw calls
+      const maxR=45*sc,step=8*sc;
+      for(let r=5;r<maxR;r+=step){
+        const alpha=0.6-r/(75*sc);if(alpha<=0)break;
+        ctx.strokeStyle=`rgba(255,255,255,${alpha})`;ctx.beginPath();
+        ctx.arc(0,0,r,t+r*0.1,t+r*0.1+Math.PI*1.5);
+        if(r+step*0.5<maxR){const r2=r+step*0.5;ctx.moveTo(r2*Math.cos(t+r2*0.1),r2*Math.sin(t+r2*0.1));ctx.arc(0,0,r2,t+r2*0.1,t+r2*0.1+Math.PI*1.5);}
+        ctx.stroke();
+      }
       ctx.restore();
     }
   }
@@ -805,7 +894,7 @@ function drawCouplingBands(){
 function drawCollectibles(){
   const sc=S(),ww=W();
   for(const c of collectibles){
-    if(!c.alive)continue;const cx=c.x-scrollOffset;
+    if(!c.alive)continue;const cx=c.x-renderScroll;
     if(cx<-30||cx>ww+30)continue;
     const cy=cachedY(cx,c.surface)+Math.sin(gameTime*3+c.phase)*8*sc;
     if(c.isPhoton){
@@ -824,10 +913,13 @@ function drawCollectibles(){
 function drawPlayer(){
   const sc=S();let px=playerX,py=playerY;
   if(playerShake>0){px+=Math.sin(gameTime*60)*playerShake*10*sc;py+=Math.cos(gameTime*45)*playerShake*6*sc;}
-  for(let i=0;i<playerTrail.length-1;i++){
-    const t=playerTrail[i];const alpha=(i/playerTrail.length)*0.4;
+  for(let ti=0;ti<trailLen-1;ti++){
+    // Read in order: oldest first (ring buffer)
+    const idx=(trailHead-trailLen+ti+TRAIL_MAX)%TRAIL_MAX;
+    const t=playerTrail[idx];if(!t.active)continue;
+    const alpha=(ti/trailLen)*0.4;
     const rgb=SURFACE_RGB[t.surf];
-    ctx.fillStyle=`rgba(${rgb[0]},${rgb[1]},${rgb[2]},${alpha})`;ctx.beginPath();ctx.arc(t.x,t.y,(3+i/playerTrail.length*6)*0.3*sc,0,Math.PI*2);ctx.fill();
+    ctx.fillStyle=`rgba(${rgb[0]},${rgb[1]},${rgb[2]},${alpha})`;ctx.beginPath();ctx.arc(t.x,t.y,(3+ti/trailLen*6)*0.3*sc,0,Math.PI*2);ctx.fill();
   }
   // Glow halo (replaces shadowBlur)
   if(playerFlash>0){
@@ -856,7 +948,7 @@ function drawPlayer(){
   }
 }
 function drawParticles(){
-  for(const p of particles){const alpha=p.life/p.maxLife;ctx.globalAlpha=alpha;ctx.fillStyle=p.color;ctx.beginPath();ctx.arc(p.x,p.y,p.size*alpha,0,Math.PI*2);ctx.fill();}
+  for(let i=0;i<particleCount;i++){const p=particles[i];const alpha=p.life/p.maxLife;ctx.globalAlpha=alpha;ctx.fillStyle=p.color;ctx.beginPath();ctx.arc(p.x,p.y,p.size*alpha,0,Math.PI*2);ctx.fill();}
   ctx.globalAlpha=1;
 }
 function drawHUD(){
@@ -1078,12 +1170,36 @@ function drawGameOver(){
 
 // --- Game Loop ---
 let lastTime=0;
+let smoothScroll=0;// visual scroll position — smoothed to absorb vsync skips
 function loop(timestamp){
   const dt=Math.min((timestamp-lastTime)/1000,0.05);
   lastTime=timestamp;
-  update(dt);draw();
-  cacheValid=false;
-  // Schedule worker for next frame's cache (runs in parallel while browser composites)
+  // Physics update uses raw scrollOffset
+  renderScroll=scrollOffset;
+  update(dt);
+  // Swap in Worker result if available (replaces cache with fresh data)
+  applyWorkerCache();
+  // If no cache at all yet (first frame / after reset), do one sync build
+  if(!cacheValid)buildSurfaceCache();
+  // Smooth visual scroll: limit per-frame advance to prevent vsync-skip jumps
+  // Normal frame: diff ≈ scrollSpeed → follows exactly
+  // Skipped frame: diff ≈ 2×scrollSpeed → capped, then gradually catches up (~10 frames)
+  const dpr=devicePixelRatio;
+  if(state===STATE.PLAYING){
+    const diff=scrollOffset-smoothScroll;
+    // maxAdvance = ~1.1 normal frames worth of scroll (allows ~10% catch-up rate)
+    const maxAdvance=scrollSpeed*60/54;
+    if(diff>0)smoothScroll+=Math.min(diff,Math.max(maxAdvance,1));
+    else smoothScroll=scrollOffset;
+    renderScroll=Math.round(smoothScroll*dpr)/dpr;
+  }else{
+    smoothScroll=scrollOffset;
+    renderScroll=Math.round(scrollOffset*dpr)/dpr;
+  }
+  // Recompute playerY with render-aligned scroll so player sits exactly on drawn surface
+  if(state===STATE.PLAYING&&cacheValid)playerY=cachedY(playerX,currentSurface);
+  draw();
+  // Fire off Worker for next frame (runs async in background)
   if(state===STATE.PLAYING)requestWorkerCache();
   requestAnimationFrame(loop);
 }
